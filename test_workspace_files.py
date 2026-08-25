@@ -986,6 +986,34 @@ class WorkspaceFilesTests(unittest.TestCase):
         self.assertEqual(head_response.headers["content-length"], "4")
         self.assertEqual(head_response.body, b"")
 
+    def test_preview_streams_video_with_content_type_and_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video_data = b"\x00\x00\x00\x18ftypmp42video-preview-data"
+            (root / "preview.mp4").write_bytes(video_data)
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {"session-1": self.session(root)},
+            ):
+                response = asyncio.run(
+                    agent_server.get_session_workspace_preview(
+                        self.request(Range="bytes=4-11"),
+                        "session-1",
+                        "preview.mp4",
+                    )
+                )
+                body = self.response_body(response)
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.headers["content-type"], "video/mp4")
+        self.assertEqual(
+            response.headers["content-range"],
+            f"bytes 4-11/{len(video_data)}",
+        )
+        self.assertEqual(response.headers["accept-ranges"], "bytes")
+        self.assertEqual(body, video_data[4:12])
+
     def test_preview_rejects_unsupported_oversized_nonregular_and_escaping_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "workspace"

@@ -284,6 +284,23 @@ def create_claude_agent_options(**kwargs: Any) -> Any:
     return ClaudeAgentOptions(**kwargs)
 
 
+def delete_claude_sdk_session(
+    session_id: str,
+    *,
+    directory: str | None = None,
+) -> None:
+    """Delete one SDK transcript behind the optional-import fence."""
+
+    try:
+        from claude_agent_sdk import delete_session
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ClaudeSDKUnavailable(
+            "claude-agent-sdk is not installed; the Claude side session "
+            "transcript could not be deleted"
+        ) from exc
+    delete_session(session_id, directory=directory)
+
+
 @dataclass
 class ClaudeSDKHookMatcher:
     """Structural HookMatcher accepted by every supported Agent SDK build."""

@@ -87,6 +87,7 @@ from claude_sdk_client import (
     claude_background_tracking_hooks,
     claude_nondurable_scheduler_reason,
     create_claude_agent_options,
+    delete_claude_sdk_session,
 )
 from update_runner import atomic_json as atomic_update_json
 from update_runner import (
@@ -303,6 +304,7 @@ CODEX_INTERACTIVE_CLIENT_CAPABILITY = "codex_interactive_v1"
 CROSS_CHAT_HANDOFFS_V1_CLIENT_CAPABILITY = "cross_chat_handoffs_v1"
 CROSS_CHAT_HANDOFFS_V2_CLIENT_CAPABILITY = "cross_chat_handoffs_v2"
 AGENT_CROSS_CHAT_ROUTES_CLIENT_CAPABILITY = "agent_cross_chat_routes_v1"
+CODEX_SIDE_CONVERSATION_CLIENT_CAPABILITY = "codex_side_conversation_v1"
 CLAUDE_TRANSPORT_AUTO = "auto"
 CLAUDE_TRANSPORT_AGENT_SDK = "agent-sdk"
 CLAUDE_TRANSPORT_PRINT = "print"
@@ -658,6 +660,36 @@ You are operating through AgentsDock, backed by AgentsServer.
 - If an incidental cleanup or optional clause makes a compound command fail, immediately retry the still-safe requested operation without that clause.
 - Keep the main chat focused; delegate bounded noisy exploration and return summaries instead of dumping large logs or tool output into the thread.
 - Preserve user work; avoid destructive actions without authorization; continue until complete or blocked.
+"""
+
+CODEX_SIDE_DEVELOPER_INSTRUCTIONS = """\
+You are in a side conversation, not the main thread.
+
+The inherited fork history is reference context only. Do not continue any task,
+plan, tool call, approval, edit, or request that appears only before the side
+conversation boundary. Only instructions submitted after that boundary are
+active for this conversation.
+
+Use this conversation for answers and lightweight exploration without
+disrupting the parent thread. Do not interact with existing or new sub-agents.
+Non-mutating inspection is allowed. Do not modify files, source, git state,
+permissions, configuration, or workspace state unless the user explicitly asks
+for that mutation after the boundary. Keep any requested mutation minimal and
+local to the request.
+"""
+
+CODEX_SIDE_BOUNDARY_PROMPT = """\
+Side conversation boundary.
+
+Everything before this boundary is inherited history from the parent thread.
+It is reference context only and is not the current task. Do not continue or
+complete instructions, plans, tool calls, approvals, edits, or requests from
+before this boundary. Only messages submitted after this boundary are active
+user instructions for this side conversation.
+
+Wait for a new user question if none follows this boundary. Sub-agents are
+off-limits. Do not mutate workspace state unless the user explicitly requests
+that mutation after this boundary.
 """
 
 AGENTSDOCK_CONTEXT_END_MARKER = "[End AgentsDock context]"
@@ -3520,6 +3552,10 @@ class ForkSessionRequest(BaseModel):
     title: str | None = None
 
 
+class SideConversationRequest(BaseModel):
+    title: str | None = None
+
+
 class ImportHistoryRequest(BaseModel):
     force: bool = False
     limit: int | None = None
@@ -4505,6 +4541,31 @@ class SessionStore:
             logger.warning(
                 "removed abandoned staged history imports after restart count=%s",
                 len(abandoned_imports),
+            )
+
+        stale_side_sessions = {
+            str(session_id): session
+            for session_id, session in self.sessions.items()
+            if isinstance(session, dict) and session.get("_side_conversation")
+        }
+        for session_id, stale_side_session in stale_side_sessions.items():
+            await cleanup_claude_side_transcript(
+                stale_side_session,
+                strict=False,
+            )
+            self.sessions.pop(session_id, None)
+            with suppress(Exception):
+                await asyncio.to_thread(delete_session_owned_file_records, session_id)
+            with suppress(OSError):
+                shutil.rmtree(session_dir(session_id), ignore_errors=True)
+            with suppress(Exception):
+                await forget_event_seq(session_id)
+            HISTORY_SEARCH_DIRTY.add(session_id)
+        if stale_side_sessions:
+            runtime_changed = True
+            logger.info(
+                "discarded ephemeral side conversations after restart count=%s",
+                len(stale_side_sessions),
             )
         abandoned_forks = {
             str(session_id): session
@@ -19316,6 +19377,7 @@ def active_history_search_session_ids() -> set[str]:
         if isinstance(session, dict)
         and not bool(session.get("archived"))
         and not bool(session.get("_fork_initializing"))
+        and not bool(session.get("_side_conversation"))
     }
 
 
@@ -25406,6 +25468,77 @@ def validated_claude_fork_provider_id(
     return requested_provider_id
 
 
+def claude_side_cleanup_target(
+    session: dict[str, Any],
+) -> tuple[str, str | None] | None:
+    """Return only a Claude provider transcript owned by an ephemeral side chat.
+
+    Before its first turn a Claude side chat points ``fork_from`` at the parent
+    transcript.  That source must never be deleted.  Once Claude creates the
+    native fork, ``save_provider_session`` replaces the provider id and clears
+    ``fork_from``; only that independently owned transcript is disposable.
+    """
+
+    if (
+        not session.get("_side_conversation")
+        or str(session.get("backend") or DEFAULT_BACKEND).strip().lower()
+        != BACKEND_CLAUDE
+    ):
+        return None
+    provider_id = str(
+        session.get("claude_session_id")
+        or session.get("session_id")
+        or ""
+    ).strip()
+    source_id = str(session.get("fork_from") or "").strip()
+    if not provider_id or provider_id == source_id:
+        return None
+    cwd = str(
+        session.get("claude_session_cwd")
+        or session.get("cwd")
+        or ""
+    ).strip()
+    return provider_id, cwd or None
+
+
+async def cleanup_claude_side_transcript(
+    session: dict[str, Any],
+    *,
+    strict: bool,
+) -> bool:
+    """Delete the provider-owned transcript for one ephemeral Claude side chat."""
+
+    target = claude_side_cleanup_target(session)
+    if target is None:
+        return False
+    provider_id, cwd = target
+    try:
+        await asyncio.to_thread(
+            delete_claude_sdk_session,
+            provider_id,
+            directory=cwd,
+        )
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        if strict:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The ephemeral Claude transcript could not be removed; "
+                    "the side conversation was not closed. Retry shortly."
+                ),
+            ) from exc
+        logger.warning(
+            "ephemeral Claude transcript cleanup failed session=%s provider=%s: %s",
+            session.get("id"),
+            provider_id,
+            concise_error_message(exc),
+        )
+        return False
+    return True
+
+
 def find_codex_history(provider_id: str) -> Path | None:
     direct = path_if_jsonl(provider_id, CODEX_SESSIONS_ROOT)
     if direct:
@@ -26611,6 +26744,11 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     # Provider ids are intentionally omitted from summary responses, but the
     # UI still needs the authoritative first-turn backend fence.
     public["backend_locked"] = session_backend_locked(sess)
+    if sess.get("_side_conversation"):
+        public["side_conversation"] = True
+        public["side_parent_id"] = (
+            str(sess.get("_side_parent_id") or "").strip() or None
+        )
     if not summary:
         public["provider_jobs_access"] = effective_provider_jobs_access(sess)
         public["codex_goal_time_budget_exhausted"] = (
@@ -31512,6 +31650,29 @@ def codex_thread_instruction_hash(session_id: str, sess: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def codex_side_developer_instructions(
+    session_id: str,
+    sess: dict[str, Any],
+) -> str:
+    return (
+        f"{codex_thread_instructions(session_id, sess).rstrip()}\n\n"
+        f"{CODEX_SIDE_DEVELOPER_INSTRUCTIONS.strip()}"
+    )
+
+
+def claude_side_system_prompt(parent: dict[str, Any]) -> str:
+    """Preserve per-chat instructions while fencing inherited fork history."""
+
+    return "\n\n".join(
+        value
+        for value in (
+            str(parent.get("system_prompt") or "").strip(),
+            CODEX_SIDE_DEVELOPER_INSTRUCTIONS.strip(),
+        )
+        if value
+    )
+
+
 def codex_runtime_settings(sess: dict[str, Any]) -> tuple[str, str, str]:
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
     model = str(sess.get("model") or configured_model or CODEX_DEFAULT_MODEL).strip()
@@ -31634,6 +31795,14 @@ def codex_raw_developer_message(text: str) -> dict[str, Any]:
     return {
         "type": "message",
         "role": "developer",
+        "content": [{"type": "input_text", "text": text}],
+    }
+
+
+def codex_raw_user_message(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "user",
         "content": [{"type": "input_text", "text": text}],
     }
 
@@ -31936,8 +32105,22 @@ async def ensure_codex_app_server_thread(
     provider_id = str(session_provider_id(sess) or "")
     original_provider_id = provider_id
     had_provider_id = bool(provider_id)
-    instructions = codex_thread_instructions(session_id, sess)
-    instruction_hash = codex_thread_instruction_hash(session_id, sess)
+    side_conversation = bool(sess.get("_side_conversation"))
+    instructions = (
+        codex_side_developer_instructions(session_id, sess)
+        if side_conversation
+        else codex_thread_instructions(session_id, sess)
+    )
+    instruction_hash = (
+        hashlib.sha256(
+            (
+                f"agentsdock-policy-v{CODEX_THREAD_POLICY_VERSION}\0"
+                f"{instructions}"
+            ).encode("utf-8")
+        ).hexdigest()
+        if side_conversation
+        else codex_thread_instruction_hash(session_id, sess)
+    )
     stored_hash = str(sess.get("codex_instruction_hash") or "")
     policy_changed = stored_hash != instruction_hash
     pinned = False
@@ -31992,12 +32175,13 @@ async def ensure_codex_app_server_thread(
             }
             provider_id = await manager.resume_thread(provider_id, resume_params)
 
-        await reconcile_codex_thread_goal(
-            manager,
-            session_id,
-            provider_id,
-            new_thread=not had_provider_id,
-        )
+        if not side_conversation:
+            await reconcile_codex_thread_goal(
+                manager,
+                session_id,
+                provider_id,
+                new_thread=not had_provider_id,
+            )
 
         # Current Codex releases can defer changed resume instructions until a
         # later turn. Inject the one-time migration as a developer item so the
@@ -32672,17 +32856,29 @@ class CodexForkCleanupError(CodexAppServerProtocolError):
         )
 
 
-async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
+async def fork_codex_thread(
+    source_thread_id: str,
+    sess: dict[str, Any],
+    *,
+    ephemeral: bool = False,
+    developer_instructions: str | None = None,
+) -> str:
     cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
     manager = await codex_app_server_manager()
     params = {
-        **codex_thread_params(sess, cwd),
-        "ephemeral": False,
+        **codex_thread_params(
+            sess,
+            cwd,
+            developer_instructions=developer_instructions,
+        ),
+        "ephemeral": ephemeral,
         "excludeTurns": True,
-        # A fork can inherit a persistent goal. Keep it dormant until the
-        # child chat has its own policy and the inherited goal is reconciled.
-        "deferGoalContinuation": True,
     }
+    if not ephemeral:
+        # A persistent fork can inherit a goal. Keep it dormant until the
+        # child chat has its own policy and the inherited goal is reconciled.
+        # Codex rejects this flag for ephemeral side conversations.
+        params["deferGoalContinuation"] = True
     try:
         forked_id = await manager.fork_thread(source_thread_id, params)
     except BaseException as fork_exc:
@@ -32777,7 +32973,13 @@ async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
             forked_id,
             include_turns=False,
         )
-        if str(forked_thread.get("forkedFromId") or "").strip() != source_thread_id:
+        forked_from_id = str(
+            forked_thread.get("forkedFromId") or ""
+        ).strip()
+        if (
+            (not ephemeral and forked_from_id != source_thread_id)
+            or (ephemeral and forked_from_id and forked_from_id != source_thread_id)
+        ):
             raise CodexAppServerProtocolError(
                 "thread/fork ancestry could not be verified",
                 request_sent=True,
@@ -32790,6 +32992,11 @@ async def fork_codex_thread(source_thread_id: str, sess: dict[str, Any]) -> str:
                 request_sent=True,
                 safe_to_retry=False,
             )
+        if ephemeral:
+            # Ephemeral forks have no rollout and therefore cannot be resumed
+            # after LRU eviction. Keep the side thread loaded until its local
+            # session is explicitly closed.
+            await pin_codex_app_server_thread(forked_id)
         await touch_codex_app_server_thread(manager, forked_id)
         return forked_id
     except BaseException:
@@ -32811,12 +33018,26 @@ async def bind_forked_codex_thread(
     *,
     require_goal_support: bool = False,
     expected_goal: dict[str, Any] | None = None,
+    developer_instructions: str | None = None,
+    reconcile_goal: bool = True,
 ) -> tuple[str, str]:
     """Bind a native fork to its child chat's policy before exposing it."""
     cwd = existing_cwd(str(sess.get("cwd") or DEFAULT_CWD))
     manager = await codex_app_server_manager()
-    instructions = codex_thread_instructions(session_id, sess)
-    instruction_hash = codex_thread_instruction_hash(session_id, sess)
+    instructions = developer_instructions or codex_thread_instructions(
+        session_id,
+        sess,
+    )
+    instruction_hash = (
+        hashlib.sha256(
+            (
+                f"agentsdock-policy-v{CODEX_THREAD_POLICY_VERSION}\0"
+                f"{instructions}"
+            ).encode("utf-8")
+        ).hexdigest()
+        if developer_instructions is not None
+        else codex_thread_instruction_hash(session_id, sess)
+    )
     await pin_codex_app_server_thread(thread_id, manager)
     bound_thread_id = thread_id
     try:
@@ -32856,14 +33077,15 @@ async def bind_forked_codex_thread(
         # thread/fork deferred inherited goal continuation. Reconcile now,
         # before the endpoint exposes the child; an active goal is paused
         # because this new chat has no local run owner.
-        await reconcile_codex_thread_goal(
-            manager,
-            session_id,
-            bound_thread_id,
-            force=True,
-            require_goal_support=require_goal_support,
-            expected_goal=expected_goal,
-        )
+        if reconcile_goal:
+            await reconcile_codex_thread_goal(
+                manager,
+                session_id,
+                bound_thread_id,
+                force=True,
+                require_goal_support=require_goal_support,
+                expected_goal=expected_goal,
+            )
         await touch_codex_app_server_thread(manager, bound_thread_id)
         return bound_thread_id, instruction_hash
     except Exception:
@@ -41980,6 +42202,14 @@ async def health() -> dict[str, Any]:
     restart_blocker_snapshot = await current_server_restart_blocker_snapshot()
     pressure = host_pressure_snapshot()
     tmux = tmux_capability(use_cache=True)
+    side_conversation_backends = []
+    if CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC:
+        side_conversation_backends.append(BACKEND_CODEX)
+    if (
+        CLAUDE_TRANSPORT != CLAUDE_TRANSPORT_PRINT
+        and claude_sdk_dependency_available()
+    ):
+        side_conversation_backends.append(BACKEND_CLAUDE)
     return {
         "ok": True,
         "server_version": SERVER_VERSION,
@@ -42121,6 +42351,26 @@ async def health() -> dict[str, Any]:
                     "shell_command": True,
                     "background_terminals": "experimental",
                 },
+            },
+            "side_conversations": {
+                "available": bool(side_conversation_backends),
+                "required": False,
+                "message": (
+                    "Ephemeral provider-native side conversations are available."
+                    if side_conversation_backends
+                    else "Side conversations require a native Codex or Claude transport."
+                ),
+                "action": (
+                    None
+                    if side_conversation_backends
+                    else (
+                        "Set AGENTSDOCK_CODEX_TRANSPORT=app-server or auto, "
+                        "or enable the Claude Agent SDK transport."
+                    )
+                ),
+                "version": 2,
+                "backends": side_conversation_backends,
+                "client_capability": CODEX_SIDE_CONVERSATION_CLIENT_CAPABILITY,
             },
             "claude_controls": {
                 "available": (
@@ -43441,6 +43691,7 @@ async def list_sessions(summary: bool = False) -> dict[str, Any]:
         public_session(session, summary=summary)
         for session in sorted_sessions(list(STORE.sessions.values()))
         if not session.get("_fork_initializing")
+        and not session.get("_side_conversation")
     ]
     return {"sessions": sessions}
 
@@ -45861,6 +46112,7 @@ async def reorder_session(session_id: str, req: ReorderSessionRequest) -> dict[s
             public_session(sess)
             for sess in sessions
             if not sess.get("_fork_initializing")
+            and not sess.get("_side_conversation")
         ]
     }
 
@@ -46126,6 +46378,10 @@ async def delete_session(session_id: str) -> dict[str, Any]:
                             "the session was not deleted. Retry shortly."
                         ),
                     )
+            await cleanup_claude_side_transcript(
+                late_session,
+                strict=True,
+            )
             await fence_secure_peer_chat_retirement(session_id)
             try:
                 await asyncio.to_thread(
@@ -46221,6 +46477,211 @@ async def delete_session(session_id: str) -> dict[str, Any]:
             raise
 
 
+@app.post("/api/sessions/{session_id}/side")
+async def start_side_conversation(
+    session_id: str,
+    req: SideConversationRequest,
+) -> dict[str, Any]:
+    """Create a hidden ephemeral provider fork without stopping its parent."""
+
+    cleanup_state: dict[str, str | None] = {}
+    async with session_lifecycle_lock(session_id):
+        try:
+            ensure_session_not_deleting(session_id)
+            parent_record = STORE.sessions.get(session_id)
+            parent = (
+                dict(parent_record)
+                if isinstance(parent_record, dict)
+                else None
+            )
+            if not parent:
+                raise HTTPException(status_code=404, detail="session not found")
+            if parent.get("_side_conversation"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="start a side conversation from its parent chat",
+                )
+            parent_backend = str(
+                parent.get("backend") or DEFAULT_BACKEND
+            ).strip().lower()
+            if parent_backend not in {BACKEND_CODEX, BACKEND_CLAUDE}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="side conversations require a Codex or Claude chat",
+                )
+            if (
+                parent_backend == BACKEND_CODEX
+                and CODEX_TRANSPORT == CODEX_TRANSPORT_EXEC
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="side conversations require the Codex app-server transport",
+                )
+            if (
+                parent_backend == BACKEND_CLAUDE
+                and (
+                    CLAUDE_TRANSPORT == CLAUDE_TRANSPORT_PRINT
+                    or not claude_sdk_dependency_available()
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Claude side conversations require the Claude Agent "
+                        "SDK transport"
+                    ),
+                )
+
+            existing = next(
+                (
+                    candidate
+                    for candidate in STORE.sessions.values()
+                    if isinstance(candidate, dict)
+                    and candidate.get("_side_conversation")
+                    and str(candidate.get("_side_parent_id") or "") == session_id
+                    and not candidate.get("_fork_initializing")
+                    and str(candidate.get("id") or "") not in DELETING_SESSIONS
+                ),
+                None,
+            )
+            if existing is not None:
+                return {
+                    "session": public_session(existing),
+                    "reused": True,
+                }
+
+            fork_cwd = validated_fork_cwd(parent)
+            parent["cwd"] = fork_cwd
+            source_provider_id = (
+                str(session_codex_thread_id(parent) or "").strip()
+                if parent_backend == BACKEND_CODEX
+                else str(
+                    validated_claude_fork_provider_id(
+                        parent,
+                        session_id,
+                        fork_cwd,
+                    )
+                    or ""
+                ).strip()
+            )
+            if not source_provider_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "side conversations are unavailable until this "
+                        f"{parent_backend.title()} chat has started; send a "
+                        "message first"
+                    ),
+                )
+            child = await STORE.create(
+                CreateSessionRequest(
+                    title=req.title or f"Side · {parent.get('title') or session_id}",
+                    folder=parent.get("folder"),
+                    cwd=fork_cwd,
+                    backend=parent_backend,
+                    model=parent.get("model"),
+                    effort=parent.get("effort"),
+                    system_prompt=(
+                        claude_side_system_prompt(parent)
+                        if parent_backend == BACKEND_CLAUDE
+                        else parent.get("system_prompt")
+                    ),
+                    claude_permission_mode=(
+                        effective_claude_permission_mode(parent)
+                    ),
+                    codex_approval_policy=parent.get("codex_approval_policy"),
+                    codex_sandbox_mode=parent.get("codex_sandbox_mode"),
+                    codex_permission_profile=parent.get("codex_permission_profile"),
+                    codex_approvals_reviewer=parent.get("codex_approvals_reviewer"),
+                    pinned=False,
+                    archived=False,
+                    provider_session_id=None,
+                    codex_thread_id=None,
+                ),
+                parent_id=session_id,
+                initializing_fork=True,
+            )
+            cleanup_state["child_session_id"] = child["id"]
+            async with STORE._lock:
+                current = STORE.sessions.get(child["id"])
+                if current is None:
+                    raise RuntimeError("side conversation disappeared during setup")
+                current["_side_conversation"] = True
+                current["_side_parent_id"] = session_id
+                if parent_backend == BACKEND_CLAUDE:
+                    current["fork_from"] = source_provider_id
+                await STORE.save()
+                child = current
+
+            if parent_backend == BACKEND_CODEX:
+                instructions = codex_side_developer_instructions(
+                    child["id"],
+                    child,
+                )
+                forked_thread_id = await fork_codex_thread(
+                    source_provider_id,
+                    child,
+                    ephemeral=True,
+                    developer_instructions=instructions,
+                )
+                cleanup_state["provider_thread_id"] = forked_thread_id
+                await save_staged_fork_provider_reference(
+                    child["id"],
+                    forked_thread_id,
+                )
+                if not await forget_abandoned_fork_provider_thread(
+                    forked_thread_id
+                ):
+                    raise RuntimeError(
+                        "could not commit side conversation cleanup ownership"
+                    )
+                child = STORE.sessions[child["id"]]
+                manager = await codex_app_server_manager()
+                instruction_hash = hashlib.sha256(
+                    (
+                        f"agentsdock-policy-v{CODEX_THREAD_POLICY_VERSION}\0"
+                        f"{instructions}"
+                    ).encode("utf-8")
+                ).hexdigest()
+                # Ephemeral Codex forks intentionally have no rollout on disk,
+                # so publish their provider identity while the shared process
+                # still owns the loaded thread. Claude creates its native fork
+                # lazily on the first side turn through ``fork_session=True``.
+                await STORE.save_provider_session(
+                    child["id"],
+                    forked_thread_id,
+                    BACKEND_CODEX,
+                    codex_instruction_hash=instruction_hash,
+                )
+                await touch_codex_app_server_thread(manager, forked_thread_id)
+                await manager.inject_items(
+                    forked_thread_id,
+                    [codex_raw_user_message(CODEX_SIDE_BOUNDARY_PROMPT)],
+                )
+
+            async with STORE._lock:
+                current = STORE.sessions.get(child["id"])
+                if current is None:
+                    raise RuntimeError("side conversation disappeared before publish")
+                initializing_marker = current.pop("_fork_initializing", None)
+                try:
+                    await STORE.save()
+                except BaseException:
+                    if initializing_marker is not None:
+                        current["_fork_initializing"] = initializing_marker
+                    raise
+                child = current
+            cleanup_state["provider_thread_id"] = None
+            cleanup_state["child_session_id"] = None
+            return {
+                "session": public_session(child),
+                "reused": False,
+            }
+        except BaseException:
+            await cleanup_aborted_session_fork(cleanup_state)
+            raise
+
+
 @app.post("/api/sessions/{session_id}/fork")
 async def fork_session(session_id: str, req: ForkSessionRequest) -> dict[str, Any]:
     cleanup_state: dict[str, str | None] = {}
@@ -46257,6 +46718,11 @@ async def _fork_session_locked(
     parent = dict(parent_record) if isinstance(parent_record, dict) else None
     if not parent:
         raise HTTPException(status_code=404, detail="session not found")
+    if parent.get("_side_conversation"):
+        raise HTTPException(
+            status_code=409,
+            detail="side conversations are ephemeral and cannot be forked",
+        )
     fork_cwd = validated_fork_cwd(parent)
     parent["cwd"] = fork_cwd
     parent_backend = (parent.get("backend") or DEFAULT_BACKEND).lower()
@@ -46530,6 +46996,7 @@ async def _fork_session_locked(
         session
         for session in STORE.sessions.values()
         if not session.get("_fork_initializing")
+        and not session.get("_side_conversation")
     ])
     return {"session": public_session(child), "sessions": [public_session(sess) for sess in ordered_sessions]}
 

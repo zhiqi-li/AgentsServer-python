@@ -10,6 +10,378 @@ from unittest.mock import AsyncMock, Mock, patch
 import agent_server
 
 
+class SideConversationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_codex_parent_can_start_ephemeral_side_conversation(self) -> None:
+        parent_id = "busy-parent"
+        child_id = "side-child"
+        provider_id = "thread-side"
+        parent = {
+            "id": parent_id,
+            "title": "Main task",
+            "folder": "General",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "thread-parent",
+            "model": "gpt-5.5",
+            "effort": "xhigh",
+        }
+        child = {
+            "id": child_id,
+            "title": "Side · Main task",
+            "folder": "General",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CODEX,
+            "session_id": None,
+            "codex_thread_id": None,
+            "parent_id": parent_id,
+            "_fork_initializing": True,
+        }
+        sessions = {parent_id: parent}
+
+        async def create_child(*_args, **kwargs) -> dict:
+            self.assertTrue(kwargs["initializing_fork"])
+            sessions[child_id] = child
+            return child
+
+        async def save_provider(
+            requested_child_id: str,
+            requested_provider_id: str,
+            backend: str,
+            **kwargs,
+        ) -> None:
+            self.assertEqual(requested_child_id, child_id)
+            self.assertEqual(requested_provider_id, provider_id)
+            self.assertEqual(backend, agent_server.BACKEND_CODEX)
+            self.assertTrue(kwargs["codex_instruction_hash"])
+            child["session_id"] = provider_id
+            child["codex_thread_id"] = provider_id
+
+        manager = Mock()
+        manager.inject_items = AsyncMock()
+        fork_codex_thread = AsyncMock(return_value=provider_id)
+        with patch.object(agent_server.STORE, "sessions", sessions), patch.object(
+            agent_server.STORE,
+            "_lock",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server.STORE,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=create_child,
+        ), patch.object(
+            agent_server.STORE,
+            "save",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "fork_codex_thread",
+            fork_codex_thread,
+        ), patch.object(
+            agent_server,
+            "save_staged_fork_provider_reference",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "forget_abandoned_fork_provider_thread",
+            new_callable=AsyncMock,
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "touch_codex_app_server_thread",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server.STORE,
+            "save_provider_session",
+            new_callable=AsyncMock,
+            side_effect=save_provider,
+        ), patch.object(
+            agent_server,
+            "codex_app_server_manager",
+            new_callable=AsyncMock,
+            return_value=manager,
+        ):
+            agent_server.BUSY_SESSIONS.add(parent_id)
+            try:
+                result = await agent_server.start_side_conversation(
+                    parent_id,
+                    agent_server.SideConversationRequest(),
+                )
+            finally:
+                agent_server.BUSY_SESSIONS.discard(parent_id)
+
+        self.assertFalse(result["reused"])
+        self.assertEqual(result["session"]["id"], child_id)
+        self.assertTrue(result["session"]["side_conversation"])
+        self.assertEqual(result["session"]["side_parent_id"], parent_id)
+        self.assertNotIn("_fork_initializing", child)
+        fork_codex_thread.assert_awaited_once()
+        self.assertEqual(fork_codex_thread.await_args.args[0], "thread-parent")
+        self.assertTrue(fork_codex_thread.await_args.kwargs["ephemeral"])
+        self.assertIn(
+            "You are in a side conversation",
+            fork_codex_thread.await_args.kwargs["developer_instructions"],
+        )
+        manager.inject_items.assert_awaited_once()
+        boundary = manager.inject_items.await_args.args[1][0]
+        self.assertEqual(boundary["role"], "user")
+        self.assertIn(
+            "Side conversation boundary",
+            boundary["content"][0]["text"],
+        )
+
+    async def test_active_claude_parent_can_start_ephemeral_side_conversation(self) -> None:
+        parent_id = "busy-claude-parent"
+        child_id = "claude-side-child"
+        provider_id = "11111111-1111-4111-8111-111111111111"
+        parent = {
+            "id": parent_id,
+            "title": "Claude main task",
+            "folder": "General",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "claude_session_id": provider_id,
+            "claude_session_cwd": "/tmp",
+            "model": "claude-sonnet-4-6",
+            "effort": "high",
+            "system_prompt": "Keep the project terminology intact.",
+            "claude_permission_mode": "dontAsk",
+        }
+        child = {
+            "id": child_id,
+            "title": "Side · Claude main task",
+            "folder": "General",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "session_id": None,
+            "claude_session_id": None,
+            "parent_id": parent_id,
+            "_fork_initializing": True,
+        }
+        sessions = {parent_id: parent}
+
+        async def create_child(request, *_args, **kwargs) -> dict:
+            self.assertTrue(kwargs["initializing_fork"])
+            self.assertEqual(request.backend, agent_server.BACKEND_CLAUDE)
+            self.assertEqual(request.claude_permission_mode, "dontAsk")
+            self.assertIn("Keep the project terminology intact.", request.system_prompt)
+            self.assertIn("You are in a side conversation", request.system_prompt)
+            child["system_prompt"] = request.system_prompt
+            sessions[child_id] = child
+            return child
+
+        with patch.object(agent_server.STORE, "sessions", sessions), patch.object(
+            agent_server.STORE,
+            "_lock",
+            asyncio.Lock(),
+        ), patch.object(
+            agent_server.STORE,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=create_child,
+        ), patch.object(
+            agent_server.STORE,
+            "save",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "claude_sdk_dependency_available",
+            return_value=True,
+        ), patch.object(
+            agent_server,
+            "validated_claude_fork_provider_id",
+            return_value=provider_id,
+        ):
+            agent_server.BUSY_SESSIONS.add(parent_id)
+            try:
+                result = await agent_server.start_side_conversation(
+                    parent_id,
+                    agent_server.SideConversationRequest(),
+                )
+            finally:
+                agent_server.BUSY_SESSIONS.discard(parent_id)
+
+        self.assertFalse(result["reused"])
+        self.assertEqual(result["session"]["id"], child_id)
+        self.assertTrue(result["session"]["side_conversation"])
+        self.assertEqual(result["session"]["side_parent_id"], parent_id)
+        self.assertEqual(child["fork_from"], provider_id)
+        self.assertNotIn("_fork_initializing", child)
+
+    async def test_claude_side_cleanup_deletes_only_the_owned_fork(self) -> None:
+        parent_provider_id = "11111111-1111-4111-8111-111111111111"
+        child_provider_id = "22222222-2222-4222-8222-222222222222"
+        unopened = {
+            "id": "unopened-side",
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CLAUDE,
+            "session_id": None,
+            "claude_session_id": None,
+            "fork_from": parent_provider_id,
+            "_side_conversation": True,
+        }
+        opened = {
+            **unopened,
+            "id": "opened-side",
+            "session_id": child_provider_id,
+            "claude_session_id": child_provider_id,
+            "fork_from": None,
+            "claude_session_cwd": "/tmp",
+        }
+        delete_provider = Mock()
+        with patch.object(
+            agent_server,
+            "delete_claude_sdk_session",
+            delete_provider,
+        ):
+            self.assertFalse(
+                await agent_server.cleanup_claude_side_transcript(
+                    unopened,
+                    strict=True,
+                )
+            )
+            self.assertTrue(
+                await agent_server.cleanup_claude_side_transcript(
+                    opened,
+                    strict=True,
+                )
+            )
+
+        delete_provider.assert_called_once_with(
+            child_provider_id,
+            directory="/tmp",
+        )
+
+    async def test_existing_side_conversation_is_reused(self) -> None:
+        parent_id = "parent"
+        side_id = "side"
+        parent = {
+            "id": parent_id,
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": "thread-parent",
+        }
+        side = {
+            "id": side_id,
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CODEX,
+            "_side_conversation": True,
+            "_side_parent_id": parent_id,
+        }
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {parent_id: parent, side_id: side},
+        ), patch.object(
+            agent_server.STORE,
+            "create",
+            new_callable=AsyncMock,
+        ) as create:
+            result = await agent_server.start_side_conversation(
+                parent_id,
+                agent_server.SideConversationRequest(),
+            )
+
+        self.assertTrue(result["reused"])
+        self.assertEqual(result["session"]["id"], side_id)
+        create.assert_not_awaited()
+
+    async def test_side_conversation_requires_started_codex_thread(self) -> None:
+        parent_id = "new-parent"
+        parent = {
+            "id": parent_id,
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_thread_id": None,
+            "session_id": None,
+        }
+        with patch.object(agent_server.STORE, "sessions", {parent_id: parent}):
+            with self.assertRaises(agent_server.HTTPException) as raised:
+                await agent_server.start_side_conversation(
+                    parent_id,
+                    agent_server.SideConversationRequest(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("send a message first", str(raised.exception.detail))
+
+    async def test_session_list_hides_side_conversations(self) -> None:
+        parent = {"id": "parent", "backend": agent_server.BACKEND_CODEX}
+        side = {
+            "id": "side",
+            "backend": agent_server.BACKEND_CODEX,
+            "_side_conversation": True,
+            "_side_parent_id": "parent",
+        }
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {"parent": parent, "side": side},
+        ), patch.object(
+            agent_server.STORE,
+            "ensure_sort_orders",
+            new_callable=AsyncMock,
+        ):
+            result = await agent_server.list_sessions()
+
+        self.assertEqual([session["id"] for session in result["sessions"]], ["parent"])
+
+    async def test_loaded_side_thread_is_used_without_resume_or_goal_reconcile(self) -> None:
+        side_id = "side"
+        thread_id = "thread-side"
+        side = {
+            "id": side_id,
+            "cwd": "/tmp",
+            "backend": agent_server.BACKEND_CODEX,
+            "session_id": thread_id,
+            "codex_thread_id": thread_id,
+            "_side_conversation": True,
+            "_side_parent_id": "parent",
+        }
+        instructions = agent_server.codex_side_developer_instructions(
+            side_id,
+            side,
+        )
+        side["codex_instruction_hash"] = agent_server.hashlib.sha256(
+            (
+                f"agentsdock-policy-v{agent_server.CODEX_THREAD_POLICY_VERSION}\0"
+                f"{instructions}"
+            ).encode("utf-8")
+        ).hexdigest()
+        manager = Mock()
+        manager.is_thread_loaded.return_value = True
+        manager.resume_thread = AsyncMock()
+        manager.start_thread = AsyncMock()
+        manager.inject_items = AsyncMock()
+        with patch.object(
+            agent_server,
+            "pin_codex_app_server_thread",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "touch_codex_app_server_thread",
+            new_callable=AsyncMock,
+        ), patch.object(
+            agent_server,
+            "reconcile_codex_thread_goal",
+            new_callable=AsyncMock,
+        ) as reconcile_goal:
+            result, instruction_hash = (
+                await agent_server.ensure_codex_app_server_thread(
+                    manager,
+                    side_id,
+                    side,
+                    "/tmp",
+                )
+            )
+
+        self.assertEqual(result, thread_id)
+        self.assertEqual(instruction_hash, side["codex_instruction_hash"])
+        manager.resume_thread.assert_not_awaited()
+        manager.start_thread.assert_not_awaited()
+        manager.inject_items.assert_not_awaited()
+        reconcile_goal.assert_not_awaited()
+
+
 class ForkHistoryCloneTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def write_registered_file(
@@ -2313,6 +2685,44 @@ class NativeCodexForkSafetyTests(unittest.IsolatedAsyncioTestCase):
             agent_server.ABANDONED_FORK_PROVIDER_THREADS,
             {"thread-child"},
         )
+
+    async def test_ephemeral_provider_fork_omits_goal_defer_and_stays_loaded(self) -> None:
+        manager = Mock()
+        manager.fork_thread = AsyncMock(return_value="thread-side")
+        manager.read_thread = AsyncMock(return_value={
+            "id": "thread-side",
+            # Current Codex omits forkedFromId for ephemeral threads.
+            "cwd": "/tmp",
+        })
+        manager.delete_thread = AsyncMock()
+        with patch.object(
+            agent_server,
+            "codex_app_server_manager",
+            new_callable=AsyncMock,
+            return_value=manager,
+        ), patch.object(
+            agent_server,
+            "pin_codex_app_server_thread",
+            new_callable=AsyncMock,
+        ) as pin_thread, patch.object(
+            agent_server,
+            "touch_codex_app_server_thread",
+            new_callable=AsyncMock,
+        ):
+            result = await agent_server.fork_codex_thread(
+                "thread-parent",
+                {"cwd": "/tmp", "backend": agent_server.BACKEND_CODEX},
+                ephemeral=True,
+                developer_instructions="side policy",
+            )
+
+        self.assertEqual(result, "thread-side")
+        params = manager.fork_thread.await_args.args[1]
+        self.assertTrue(params["ephemeral"])
+        self.assertNotIn("deferGoalContinuation", params)
+        self.assertEqual(params["developerInstructions"], "side policy")
+        pin_thread.assert_awaited_once_with("thread-side")
+        manager.delete_thread.assert_not_awaited()
 
     async def test_provider_fork_is_journaled_before_verification(self) -> None:
         order: list[str] = []

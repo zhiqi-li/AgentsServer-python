@@ -347,10 +347,12 @@ PROVIDER_CROSS_CHAT_ROUTE_AUDIT_ID_RE = re.compile(r"^audit_[0-9a-f]{32}$")
 CODEX_APPROVAL_POLICIES = {"never", "on-request", "untrusted"}
 CODEX_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 CODEX_APPROVAL_REVIEWERS = {"user", "auto_review", "guardian_subagent"}
+CODEX_COLLABORATION_MODES = {"default", "plan"}
 CODEX_DEFAULT_APPROVAL_POLICY = "never"
 CODEX_DEFAULT_SANDBOX_MODE = "danger-full-access"
 CODEX_DEFAULT_PERMISSION_PROFILE: str | None = None
 CODEX_DEFAULT_APPROVALS_REVIEWER = "user"
+CODEX_DEFAULT_COLLABORATION_MODE = "default"
 # Turns from clients without the interactive app-server capability cannot
 # service approval requests. Keep their deliberate fail-closed policy separate
 # from the user-facing session defaults above.
@@ -3420,6 +3422,7 @@ class CreateSessionRequest(BaseModel):
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
+    codex_collaboration_mode: Literal["default", "plan"] | None = None
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
     import_history: bool | None = None
 
@@ -3480,6 +3483,7 @@ class UpdateSessionRequest(BaseModel):
     codex_sandbox_mode: Literal["read-only", "workspace-write", "danger-full-access"] | None = None
     codex_permission_profile: str | None = Field(default=None, max_length=240)
     codex_approvals_reviewer: Literal["user", "auto_review", "guardian_subagent"] | None = None
+    codex_collaboration_mode: Literal["default", "plan"] | None = None
     provider_jobs_access: Literal["full", "read_only", "blocked"] | None = None
 
 
@@ -3494,6 +3498,7 @@ SESSION_LIFECYCLE_UPDATE_FIELDS = frozenset({
     "codex_sandbox_mode",
     "codex_permission_profile",
     "codex_approvals_reviewer",
+    "codex_collaboration_mode",
     "provider_jobs_access",
     "archived",
 })
@@ -3901,6 +3906,20 @@ def effective_claude_permission_mode(sess: dict[str, Any]) -> str:
         value
         if value in CLAUDE_PERMISSION_MODES
         else CLAUDE_DEFAULT_PERMISSION_MODE
+    )
+
+
+def effective_codex_collaboration_mode(sess: dict[str, Any]) -> str:
+    """Return the durable Codex collaboration mode for this chat."""
+
+    value = str(
+        sess.get("codex_collaboration_mode")
+        or CODEX_DEFAULT_COLLABORATION_MODE
+    ).strip().lower()
+    return (
+        value
+        if value in CODEX_COLLABORATION_MODES
+        else CODEX_DEFAULT_COLLABORATION_MODE
     )
 
 
@@ -4735,6 +4754,10 @@ class SessionStore:
             if sess.get("claude_permission_mode") != claude_permission_mode:
                 sess["claude_permission_mode"] = claude_permission_mode
                 runtime_changed = True
+            codex_collaboration_mode = effective_codex_collaboration_mode(sess)
+            if sess.get("codex_collaboration_mode") != codex_collaboration_mode:
+                sess["codex_collaboration_mode"] = codex_collaboration_mode
+                runtime_changed = True
             provider_jobs_access = effective_provider_jobs_access(sess)
             if sess.get("provider_jobs_access") != provider_jobs_access:
                 sess["provider_jobs_access"] = provider_jobs_access
@@ -4930,6 +4953,10 @@ class SessionStore:
                 req.codex_approvals_reviewer
                 or CODEX_DEFAULT_APPROVALS_REVIEWER
             ),
+            "codex_collaboration_mode": (
+                req.codex_collaboration_mode
+                or CODEX_DEFAULT_COLLABORATION_MODE
+            ),
             "provider_jobs_access": (
                 req.provider_jobs_access or PROVIDER_JOBS_ACCESS_DEFAULT
             ),
@@ -5064,6 +5091,11 @@ class SessionStore:
                     "codex_approvals_reviewer",
                     CODEX_DEFAULT_APPROVALS_REVIEWER,
                     CODEX_APPROVAL_REVIEWERS,
+                ),
+                (
+                    "codex_collaboration_mode",
+                    CODEX_DEFAULT_COLLABORATION_MODE,
+                    CODEX_COLLABORATION_MODES,
                 ),
                 (
                     "provider_jobs_access",
@@ -27653,6 +27685,11 @@ def public_session(sess: dict[str, Any], *, summary: bool = False) -> dict[str, 
     # Provider ids are intentionally omitted from summary responses, but the
     # UI still needs the authoritative first-turn backend fence.
     public["backend_locked"] = session_backend_locked(sess)
+    codex_collaboration_mode = effective_codex_collaboration_mode(sess)
+    if not summary or codex_collaboration_mode != CODEX_DEFAULT_COLLABORATION_MODE:
+        # Default is intentionally omitted from list summaries to keep large
+        # fleets bounded; clients treat an absent value as Default mode.
+        public["codex_collaboration_mode"] = codex_collaboration_mode
     if sess.get("_side_conversation"):
         public["side_conversation"] = True
         public["side_parent_id"] = (
@@ -39530,6 +39567,16 @@ async def run_codex_app_server(
                     overrides["model"] = model
                 if effort:
                     overrides["effort"] = effort
+                overrides["collaborationMode"] = {
+                    "mode": effective_codex_collaboration_mode(sess),
+                    "settings": {
+                        "model": model,
+                        "reasoning_effort": effort,
+                        # null asks Codex to use its built-in instructions for
+                        # the selected mode, matching the Codex CLI behavior.
+                        "developer_instructions": None,
+                    },
+                }
                 if service_tier:
                     overrides["serviceTier"] = codex_app_server_service_tier(service_tier)
                 additional_context = codex_side_parent_additional_context(
@@ -43396,8 +43443,9 @@ async def health() -> dict[str, Any]:
                     if CODEX_TRANSPORT != CODEX_TRANSPORT_EXEC
                     else "Set AGENTSDOCK_CODEX_TRANSPORT=app-server or auto."
                 ),
-                "version": 2,
+                "version": 3,
                 "interactive_client_capability": CODEX_INTERACTIVE_CLIENT_CAPABILITY,
+                "collaboration_modes": sorted(CODEX_COLLABORATION_MODES),
                 "features": {
                     "approvals": True,
                     "questions": True,
@@ -43409,6 +43457,8 @@ async def health() -> dict[str, Any]:
                     "thread_status": True,
                     "shell_command": True,
                     "background_terminals": "experimental",
+                    "collaboration_modes": True,
+                    "plan_mode": True,
                 },
             },
             "side_conversations": {
@@ -45258,6 +45308,31 @@ async def ensure_claude_permission_mode_update_allowed(
             )
 
 
+async def ensure_codex_collaboration_mode_update_allowed(
+    session_id: str,
+    current: dict[str, Any],
+    patch: dict[str, Any],
+) -> None:
+    """Do not change Codex collaboration mode underneath an active turn."""
+
+    if "codex_collaboration_mode" not in patch:
+        return
+    requested = effective_codex_collaboration_mode({
+        "codex_collaboration_mode": patch.get("codex_collaboration_mode"),
+    })
+    if requested == effective_codex_collaboration_mode(current):
+        return
+    async with ACTIVE_LOCK:
+        if session_id in BUSY_SESSIONS or ACTIVE.get(session_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "wait for or stop the active Codex turn before changing "
+                    "its collaboration mode"
+                ),
+            )
+
+
 async def ensure_backend_update_allowed(
     session_id: str,
     current: dict[str, Any],
@@ -45338,6 +45413,11 @@ async def update_session(session_id: str, req: UpdateSessionRequest) -> dict[str
                 patch,
             )
             await ensure_claude_permission_mode_update_allowed(
+                session_id,
+                current,
+                patch,
+            )
+            await ensure_codex_collaboration_mode_update_allowed(
                 session_id,
                 current,
                 patch,
@@ -47698,6 +47778,7 @@ async def start_side_conversation(
                     codex_sandbox_mode=parent.get("codex_sandbox_mode"),
                     codex_permission_profile=parent.get("codex_permission_profile"),
                     codex_approvals_reviewer=parent.get("codex_approvals_reviewer"),
+                    codex_collaboration_mode=effective_codex_collaboration_mode(parent),
                     pinned=False,
                     archived=False,
                     provider_session_id=None,
@@ -47890,6 +47971,7 @@ async def _fork_session_locked(
             codex_sandbox_mode=parent.get("codex_sandbox_mode"),
             codex_permission_profile=parent.get("codex_permission_profile"),
             codex_approvals_reviewer=parent.get("codex_approvals_reviewer"),
+            codex_collaboration_mode=effective_codex_collaboration_mode(parent),
             provider_jobs_access=effective_provider_jobs_access(parent),
             pinned=bool(parent.get("pinned")),
             archived=bool(parent.get("archived")),

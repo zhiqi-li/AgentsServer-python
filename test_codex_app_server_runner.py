@@ -1155,6 +1155,43 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("permissions", overrides)
         exec_fallback.assert_not_awaited()
 
+    async def test_turn_start_applies_native_codex_plan_mode(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("plan-final", "Plan ready.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        session = {
+            **self.session,
+            "codex_collaboration_mode": "plan",
+        }
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "Plan this change",
+                session,
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=False,
+                interactive_app_server=True,
+            )
+
+        overrides = manager.turn_calls[0][2]
+        collaboration_mode = overrides["collaborationMode"]
+        self.assertEqual(collaboration_mode["mode"], "plan")
+        self.assertEqual(collaboration_mode["settings"]["model"], overrides["model"])
+        self.assertEqual(
+            collaboration_mode["settings"]["reasoning_effort"],
+            overrides.get("effort"),
+        )
+        self.assertIsNone(
+            collaboration_mode["settings"]["developer_instructions"]
+        )
+        exec_fallback.assert_not_awaited()
+
     async def test_permission_profile_never_combines_with_sandbox_policy(self) -> None:
         turn = FakeTurn(
             [

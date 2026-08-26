@@ -650,6 +650,39 @@ class CodexControlValidationTests(unittest.IsolatedAsyncioTestCase):
         runtime = await agent_server.get_codex_runtime("chat")
         self.assertTrue(runtime["time_budget_exhausted"])
 
+    async def test_codex_plan_mode_is_public_and_fenced_while_running(self) -> None:
+        session = agent_server.STORE.sessions["chat"]
+        session["codex_collaboration_mode"] = "default"
+        self.assertNotIn(
+            "codex_collaboration_mode",
+            agent_server.public_session(session, summary=True),
+        )
+        session["codex_collaboration_mode"] = "plan"
+        self.assertEqual(
+            agent_server.public_session(session, summary=True)[
+                "codex_collaboration_mode"
+            ],
+            "plan",
+        )
+        session["codex_collaboration_mode"] = "default"
+
+        update = AsyncMock()
+        with patch.object(agent_server.STORE, "update", update), patch.object(
+            agent_server,
+            "ACTIVE",
+            {"chat": {"run_id": "run-active"}},
+        ), patch.object(agent_server, "BUSY_SESSIONS", {"chat"}):
+            with self.assertRaises(HTTPException) as raised:
+                await agent_server.update_session(
+                    "chat",
+                    agent_server.UpdateSessionRequest(
+                        codex_collaboration_mode="plan",
+                    ),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        update.assert_not_awaited()
+
     async def test_exhausted_time_budget_blocks_a_new_turn(self) -> None:
         agent_server.STORE.sessions["chat"].update(
             {

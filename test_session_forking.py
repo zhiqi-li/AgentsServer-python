@@ -1209,6 +1209,7 @@ class ForkSessionFallbackTests(unittest.IsolatedAsyncioTestCase):
                 "codex_sandbox_mode",
                 "codex_permission_profile",
                 "codex_approvals_reviewer",
+                "codex_collaboration_mode",
                 "provider_jobs_access",
                 "archived",
             }),

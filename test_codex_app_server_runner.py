@@ -780,6 +780,67 @@ class CodexAppServerRunnerTests(unittest.IsolatedAsyncioTestCase):
             [(agent_server.project_codex_notification, "thread-native")],
         )
 
+    async def test_side_turn_uses_native_additional_context_for_parent_state(self) -> None:
+        turn = FakeTurn(
+            [
+                agent_message("side-final", "The parent is progressing.", "final_answer"),
+                completed_notification(),
+            ]
+        )
+        manager = FakeManager(turn)
+        parent = {
+            "id": "main-chat",
+            "title": "Main calculation",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_goal": {
+                "objective": "Compute pi and verify it.",
+                "status": "active",
+                "tokensUsed": 4321,
+            },
+        }
+        side = {
+            **self.session,
+            "_side_conversation": True,
+            "_side_parent_id": "main-chat",
+        }
+        agent_server.STORE.sessions = {
+            "main-chat": parent,
+            "chat-native": side,
+        }
+        agent_server.BUSY_SESSIONS.add("main-chat")
+        stack, _events, _finished, exec_fallback = self.runner_patches(manager)
+        stack.enter_context(
+            patch.object(
+                agent_server,
+                "read_events",
+                return_value=[
+                    {
+                        "type": "reasoning_summary",
+                        "text": "Verifying a checkpoint",
+                    }
+                ],
+            )
+        )
+        with stack:
+            await agent_server.run_codex_app_server(
+                "chat-native",
+                "run-original",
+                "What is the parent doing?",
+                side,
+                Path(self.cwd) / ".runner-test-manifest.json",
+                allow_exec_fallback=True,
+            )
+
+        _thread_id, input_items, overrides = manager.turn_calls[0]
+        self.assertEqual(input_items[0]["text"], "What is the parent doing?")
+        context_entry = overrides["additionalContext"][
+            "agentsfleet_side_parent"
+        ]
+        self.assertEqual(context_entry["kind"], "application")
+        self.assertIn("Parent Goal: Compute pi and verify it.", context_entry["value"])
+        self.assertIn("Verifying a checkpoint", context_entry["value"])
+        exec_fallback.assert_not_awaited()
+
     async def test_active_goal_keeps_run_owner_across_native_continuation(self) -> None:
         turn = FakeTurn()
         manager = FakeManager(turn)

@@ -113,6 +113,10 @@ class SideConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["session"]["id"], child_id)
         self.assertTrue(result["session"]["side_conversation"])
         self.assertEqual(result["session"]["side_parent_id"], parent_id)
+        self.assertEqual(
+            result["session"]["side_parent_state"]["status"],
+            "running",
+        )
         self.assertNotIn("_fork_initializing", child)
         fork_codex_thread.assert_awaited_once()
         self.assertEqual(fork_codex_thread.await_args.args[0], "thread-parent")
@@ -128,6 +132,77 @@ class SideConversationTests(unittest.IsolatedAsyncioTestCase):
             "Side conversation boundary",
             boundary["content"][0]["text"],
         )
+
+    def test_side_parent_context_keeps_goal_and_progress_read_only(self) -> None:
+        parent_id = "parent-with-goal"
+        side = {
+            "id": "side",
+            "backend": agent_server.BACKEND_CODEX,
+            "_side_conversation": True,
+            "_side_parent_id": parent_id,
+            "codex_goal": None,
+        }
+        parent = {
+            "id": parent_id,
+            "title": "Long calculation",
+            "backend": agent_server.BACKEND_CODEX,
+            "codex_goal": {
+                "objective": "Compute pi and verify it.",
+                "status": "active",
+                "tokensUsed": 1234,
+                "timeUsedSeconds": 56,
+            },
+        }
+        parent_events = [
+            {
+                "type": "tool_finished",
+                "tool": {"name": "Bash"},
+                "output": "checkpoint verified",
+                "exit_code": 0,
+            },
+            {
+                "type": "reasoning_summary",
+                "text": "Selecting the final verification pass",
+            },
+        ]
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {parent_id: parent, "side": side},
+        ), patch.object(
+            agent_server,
+            "read_events",
+            return_value=parent_events,
+        ):
+            agent_server.BUSY_SESSIONS.add(parent_id)
+            try:
+                state = agent_server.side_parent_public_state(side)
+                context = agent_server.side_parent_reference_context(side)
+                prompt = agent_server.build_side_parent_augmented_prompt(
+                    side,
+                    "What is the current goal and progress?",
+                )
+                additional_context = (
+                    agent_server.codex_side_parent_additional_context(context)
+                )
+                public = agent_server.public_session(side, summary=True)
+            finally:
+                agent_server.BUSY_SESSIONS.discard(parent_id)
+
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["goal"]["objective"], "Compute pi and verify it.")
+        self.assertIn("Parent Goal: Compute pi and verify it.", context)
+        self.assertIn("Selecting the final verification pass", context)
+        self.assertIn("checkpoint verified", context)
+        self.assertIn("do not continue its task", context)
+        self.assertTrue(prompt.endswith("What is the current goal and progress?"))
+        self.assertIn("[Current side user prompt]", prompt)
+        self.assertEqual(
+            additional_context["agentsfleet_side_parent"],
+            {"value": context, "kind": "application"},
+        )
+        self.assertEqual(public["side_parent_state"]["goal"], state["goal"])
+        self.assertIsNone(side["codex_goal"])
 
     async def test_active_claude_parent_can_start_ephemeral_side_conversation(self) -> None:
         parent_id = "busy-claude-parent"

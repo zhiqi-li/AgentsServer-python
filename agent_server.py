@@ -1527,7 +1527,7 @@ def workspace_info_sync(session_id: str) -> dict[str, Any]:
         "root": str(root),
         "name": root.name or str(root),
         "read_only": bool(sess.get("archived")),
-        "capability_version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+        "capability_version": 7 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
         "max_text_file_bytes": workspace_text_bytes_capability(),
         "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
         "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -1756,6 +1756,59 @@ def open_workspace_preview_sync(session_id: str, relative_path: str) -> dict[str
             "revision": workspace_entry_revision(item_stat),
             "size": int(item_stat.st_size),
             "mtime_ns": int(item_stat.st_mtime_ns),
+        }
+        file_fd = -1
+        return result
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def open_absolute_preview_sync(session_id: str, absolute_path: str) -> dict[str, Any]:
+    """Securely open one explicitly named absolute media preview."""
+    if not WORKSPACE_SECURE_OPEN_AVAILABLE:
+        raise workspace_http_error(
+            501,
+            "workspace_secure_open_unavailable",
+            "Secure absolute file access is unavailable on this host.",
+        )
+    if session_id not in STORE.sessions:
+        raise workspace_http_error(404, "session_not_found", "Chat not found.")
+    root, relative, normalized = normalize_absolute_file_path(absolute_path)
+    parent_fd, name = open_workspace_parent_fd(root, relative)
+    file_fd = -1
+    try:
+        try:
+            file_fd = os.open(name, workspace_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise translate_workspace_os_error(exc, normalized) from exc
+        item_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(item_stat.st_mode):
+            raise workspace_http_error(
+                400,
+                "absolute_not_regular_file",
+                f"Not a regular file: {normalized}",
+            )
+        if item_stat.st_size > MAX_WORKSPACE_PREVIEW_BYTES:
+            raise workspace_http_error(
+                413,
+                "absolute_preview_too_large",
+                (
+                    f"{normalized} is larger than the "
+                    f"{MAX_WORKSPACE_PREVIEW_BYTES // (1024 * 1024)} MiB preview limit."
+                ),
+            )
+        result = {
+            "file_fd": file_fd,
+            "root": str(root),
+            "path": normalized,
+            "name": name,
+            "media_type": workspace_preview_media_type(normalized),
+            "revision": workspace_entry_revision(item_stat),
+            "size": int(item_stat.st_size),
+            "mtime_ns": int(item_stat.st_mtime_ns),
+            "scope": "absolute",
         }
         file_fd = -1
         return result
@@ -43042,7 +43095,7 @@ async def health() -> dict[str, Any]:
                     else "Secure workspace file access is unavailable on this host."
                 ),
                 "action": None if WORKSPACE_SECURE_OPEN_AVAILABLE else "Use a supported macOS or Linux host.",
-                "version": 6 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
+                "version": 7 if WORKSPACE_MUTATIONS_AVAILABLE else 1,
                 "max_text_file_bytes": workspace_text_bytes_capability(),
                 "max_preview_file_bytes": MAX_WORKSPACE_PREVIEW_BYTES,
                 "preview_media_types": sorted(set(WORKSPACE_PREVIEW_MEDIA_TYPES.values())),
@@ -50264,6 +50317,26 @@ async def get_session_workspace_preview(
     path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
 ) -> Response:
     preview = await asyncio.to_thread(open_workspace_preview_sync, session_id, path)
+    return workspace_preview_response(request, preview)
+
+
+@app.api_route(
+    "/api/sessions/{session_id}/workspace/absolute-preview",
+    methods=["GET", "HEAD"],
+)
+async def get_session_absolute_preview(
+    request: Request,
+    session_id: str,
+    path: str = Query(min_length=1, max_length=MAX_WORKSPACE_PATH_CHARS),
+) -> Response:
+    preview = await asyncio.to_thread(open_absolute_preview_sync, session_id, path)
+    return workspace_preview_response(request, preview)
+
+
+def workspace_preview_response(
+    request: Request,
+    preview: dict[str, Any],
+) -> Response:
     file_fd = int(preview["file_fd"])
     try:
         size = int(preview["size"])

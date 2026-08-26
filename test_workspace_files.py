@@ -91,7 +91,7 @@ class WorkspaceFilesTests(unittest.TestCase):
         ])
         self.assertEqual(second["entries"][0]["kind"], "symlink")
 
-    def test_workspace_capability_v6_entries_have_opaque_revisions_and_preview_limits(self) -> None:
+    def test_workspace_capability_v7_entries_have_opaque_revisions_and_preview_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / "app.py"
@@ -103,7 +103,7 @@ class WorkspaceFilesTests(unittest.TestCase):
                 path.write_text("second, longer\n")
                 changed = agent_server.list_workspace_entries_sync("session-1", "", 0, 20)["entries"][0]
 
-        self.assertEqual(info["capability_version"], 6)
+        self.assertEqual(info["capability_version"], 7)
         self.assertEqual(info["max_preview_file_bytes"], agent_server.MAX_WORKSPACE_PREVIEW_BYTES)
         self.assertIn("application/pdf", info["preview_media_types"])
         self.assertIn("image/png", info["preview_media_types"])
@@ -1013,6 +1013,39 @@ class WorkspaceFilesTests(unittest.TestCase):
         )
         self.assertEqual(response.headers["accept-ranges"], "bytes")
         self.assertEqual(body, video_data[4:12])
+
+    def test_absolute_preview_streams_generated_image_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "workspace"
+            generated = root / "generated"
+            workspace.mkdir()
+            generated.mkdir()
+            image_data = b"\x89PNG\r\n\x1a\nabsolute-preview-data"
+            image_path = generated / "preview.png"
+            image_path.write_bytes(image_data)
+            with patch.object(
+                agent_server.STORE,
+                "sessions",
+                {"session-1": self.session(workspace)},
+            ):
+                response = asyncio.run(
+                    agent_server.get_session_absolute_preview(
+                        self.request(Range="bytes=8-15"),
+                        "session-1",
+                        str(image_path),
+                    )
+                )
+                body = self.response_body(response)
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertEqual(
+            response.headers["content-range"],
+            f"bytes 8-15/{len(image_data)}",
+        )
+        self.assertEqual(response.headers["accept-ranges"], "bytes")
+        self.assertEqual(body, image_data[8:16])
 
     def test_preview_rejects_unsupported_oversized_nonregular_and_escaping_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

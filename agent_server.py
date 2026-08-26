@@ -43178,7 +43178,7 @@ async def health() -> dict[str, Any]:
                         "or enable the Claude Agent SDK transport."
                     )
                 ),
-                "version": 2,
+                "version": 3,
                 "backends": side_conversation_backends,
                 "client_capability": CODEX_SIDE_CONVERSATION_CLIENT_CAPABILITY,
             },
@@ -44532,13 +44532,22 @@ async def tail_session_process_log(session_id: str, path: str, lines: int = 200)
 
 
 @app.get("/api/sessions")
-async def list_sessions(summary: bool = False) -> dict[str, Any]:
+async def list_sessions(
+    summary: bool = False,
+    include_side: bool = False,
+) -> dict[str, Any]:
+    """List sessions, optionally including active ephemeral side chats.
+
+    Side conversations stay hidden from ordinary clients and navigation. A
+    client that already supports their lifecycle can opt in so it can restore
+    an active side chat after reconnecting or switching server profiles.
+    """
     await STORE.ensure_sort_orders()
     sessions = [
         public_session(session, summary=summary)
         for session in sorted_sessions(list(STORE.sessions.values()))
         if not session.get("_fork_initializing")
-        and not session.get("_side_conversation")
+        and (include_side or not session.get("_side_conversation"))
     ]
     return {"sessions": sessions}
 

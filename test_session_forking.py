@@ -325,6 +325,46 @@ class SideConversationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([session["id"] for session in result["sessions"]], ["parent"])
 
+    async def test_session_list_can_restore_active_side_conversations(self) -> None:
+        parent = {"id": "parent", "backend": agent_server.BACKEND_CODEX}
+        side = {
+            "id": "side",
+            "backend": agent_server.BACKEND_CODEX,
+            "_side_conversation": True,
+            "_side_parent_id": "parent",
+        }
+        initializing_side = {
+            "id": "initializing-side",
+            "backend": agent_server.BACKEND_CODEX,
+            "_side_conversation": True,
+            "_side_parent_id": "parent",
+            "_fork_initializing": True,
+        }
+        with patch.object(
+            agent_server.STORE,
+            "sessions",
+            {
+                "parent": parent,
+                "side": side,
+                "initializing-side": initializing_side,
+            },
+        ), patch.object(
+            agent_server.STORE,
+            "ensure_sort_orders",
+            new_callable=AsyncMock,
+        ):
+            result = await agent_server.list_sessions(include_side=True)
+
+        self.assertEqual(
+            {session["id"] for session in result["sessions"]},
+            {"parent", "side"},
+        )
+        restored_side = next(
+            session for session in result["sessions"] if session["id"] == "side"
+        )
+        self.assertTrue(restored_side["side_conversation"])
+        self.assertEqual(restored_side["side_parent_id"], "parent")
+
     async def test_loaded_side_thread_is_used_without_resume_or_goal_reconcile(self) -> None:
         side_id = "side"
         thread_id = "thread-side"

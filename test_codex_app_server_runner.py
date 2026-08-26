@@ -216,6 +216,22 @@ class FakeManager:
         return []
 
 
+class FakeThreadEvictionManager:
+    """Minimal manager double for unpin/evict_codex_app_server_thread only."""
+
+    def __init__(self) -> None:
+        self.unsubscribe_calls: list[str] = []
+
+    def active_turn(self, thread_id: str) -> object | None:
+        return None
+
+    def is_thread_loaded(self, thread_id: str) -> bool:
+        return True
+
+    async def unsubscribe_thread(self, thread_id: str) -> None:
+        self.unsubscribe_calls.append(thread_id)
+
+
 def completed_notification(status: str = "completed") -> dict[str, object]:
     return {
         "method": "turn/completed",

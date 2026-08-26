@@ -30949,7 +30949,6 @@ async def unpin_codex_app_server_thread(
     invalidate_loaded_thread: bool = False,
 ) -> None:
     """Release exactly the caller's pin and defer invalidation until safe."""
-
     if not thread_id:
         return
     async with CODEX_APP_SERVER_THREAD_LRU_LOCK:
@@ -35347,6 +35346,12 @@ async def run_claude_sdk(
         )
         return
     except Exception as exc:
+        # A client that fails before its first query (for example, credentials
+        # changed on disk after the client was created) would otherwise stay
+        # cached and keep failing the same way for every following turn until
+        # it ages out at CLAUDE_SDK_IDLE_TTL_SECONDS. Evict it immediately so
+        # the next turn starts a fresh client against whatever is currently
+        # authenticated, instead of silently reusing the stale one.
         startup_ownership_token = str(
             startup_active.get("claude_sdk_owner_token") or ""
         )

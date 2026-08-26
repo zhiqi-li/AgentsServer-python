@@ -232,7 +232,14 @@ class FakeClaudeManager:
 
 
 class FakeClaudeManagerFailingAfterOwnership(FakeClaudeManager):
-    """A reused supervisor that claims the chat, then fails delivery."""
+    """A reused supervisor that registers ownership, then fails to deliver.
+
+    Models a stale client picked up from the cache (for example, one whose
+    backing CLI process authenticated under an account that was since
+    switched out): the chat is claimed via ``on_supervisor_ready`` exactly
+    like a healthy start, but the delivery call itself then raises something
+    other than ``ClaudeSDKQueryError``.
+    """
 
     def __init__(self, error: BaseException) -> None:
         super().__init__()
@@ -3808,6 +3815,14 @@ class ClaudeSDKRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_reused_client_generic_start_failure_evicts_stale_client(
         self,
     ) -> None:
+        """A non-ClaudeSDKQueryError start failure must not leave a stale
+        client cached. Regression test: previously only ClaudeSDKQueryError
+        triggered eviction here, so a client that failed for any other
+        reason immediately after claiming ownership (for example, one whose
+        backing CLI process authenticated under an account that was since
+        switched out) stayed cached and kept failing the same way on every
+        following turn until it aged out after CLAUDE_SDK_IDLE_TTL_SECONDS.
+        """
         manager = FakeClaudeManagerFailingAfterOwnership(
             RuntimeError("client not authenticated")
         )

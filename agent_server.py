@@ -37255,6 +37255,11 @@ async def run_codex_app_server(
     error_emitted = False
     delivery_unknown = False
     turn_completed = False
+    goal = sess.get("codex_goal")
+    native_goal_status = (
+        str(goal.get("status") or "") if isinstance(goal, dict) else ""
+    )
+    awaiting_goal_continuation = False
     current_run_id = run_id
     current_provider_prompt = prompt
     current_diff_baseline = diff_baseline
@@ -37623,6 +37628,11 @@ async def run_codex_app_server(
         if turn is None or turn_completed:
             raise NativeSteerHandoffError(
                 "the active Codex turn has already completed",
+                safe_to_requeue=True,
+            )
+        if awaiting_goal_continuation:
+            raise NativeSteerHandoffError(
+                "the active Codex goal is starting its next turn",
                 safe_to_requeue=True,
             )
 
@@ -38166,6 +38176,7 @@ async def run_codex_app_server(
 
     async def handle_notification(notification: dict[str, Any]) -> bool:
         nonlocal terminal_status, terminal_error, turn_completed
+        nonlocal native_goal_status, awaiting_goal_continuation
         nonlocal pending_unknown_message, pending_unknown_item_id
         nonlocal ambiguous_turn_start, error_emitted
         method = str(notification.get("method") or "")
@@ -38180,6 +38191,30 @@ async def run_codex_app_server(
         if turn is not None and turn.turn_id:
             ambiguous_turn_start = False
             await bind_active_turn_and_reconcile_stop()
+
+        if method == "turn/started" and awaiting_goal_continuation:
+            awaiting_goal_continuation = False
+            terminal_status = "failed"
+            terminal_error = None
+
+        if method == "thread/goal/updated":
+            updated_goal = params.get("goal")
+            native_goal_status = (
+                str(updated_goal.get("status") or "")
+                if isinstance(updated_goal, dict)
+                else ""
+            )
+            if awaiting_goal_continuation and native_goal_status != "active":
+                turn_completed = True
+                return True
+            return False
+
+        if method == "thread/goal/cleared":
+            native_goal_status = ""
+            if awaiting_goal_continuation:
+                turn_completed = True
+                return True
+            return False
 
         stopped_output = stop_requested_for_current_run()
         if stopped_output:
@@ -38309,6 +38344,13 @@ async def run_codex_app_server(
             terminal_status = str(completed_turn.get("status") or "failed")
             if completed_turn.get("error"):
                 terminal_error = concise_error_message(completed_turn.get("error"))
+            if (
+                terminal_status == "completed"
+                and native_goal_status == "active"
+                and not stop_requested_for_current_run()
+            ):
+                awaiting_goal_continuation = True
+                return False
             turn_completed = True
             return True
         return False
@@ -38581,6 +38623,7 @@ async def run_codex_app_server(
                         provider_id,
                         [{"type": "text", "text": prompt, "text_elements": []}],
                         overrides=overrides,
+                        follow_goal_continuations=True,
                     )
                 except CodexAppServerError as exc:
                     pending_turn = getattr(exc, "pending_turn", None)

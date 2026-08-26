@@ -24,7 +24,7 @@ class FakeWebSocket:
 
 
 class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
-    async def test_catchup_projects_completed_commentary_into_chat_body(self) -> None:
+    async def test_catchup_keeps_completed_commentary_in_reasoning_trace(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "events.jsonl"
             path.write_text(
@@ -55,7 +55,7 @@ class EventWebSocketCatchupTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(cursor, 1)
-        self.assertEqual(socket.events[0]["type"], "assistant_text")
+        self.assertEqual(socket.events[0]["type"], "reasoning_summary")
         self.assertEqual(socket.events[0]["phase"], "commentary")
 
     async def test_catchup_drains_more_than_one_page_without_raw_events(self) -> None:

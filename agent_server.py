@@ -14917,15 +14917,16 @@ def is_completed_commentary_event(event: dict[str, Any]) -> bool:
 def client_safe_event(event: dict[str, Any]) -> dict[str, Any]:
     safe = event
     if (
-        str(event.get("type") or "") == "reasoning_summary"
+        str(event.get("type") or "") == "assistant_text"
         and is_completed_commentary_event(event)
     ):
-        # Codex reports completed progress updates as agent messages with the
-        # commentary phase. Keep the provider-shaped event in durable history,
-        # but expose it as assistant text so every client path (live, catch-up,
-        # and reload) renders the update in the conversation body.
+        # Older AgentsServer releases persisted Codex progress updates as
+        # assistant_text. The provider phase is authoritative: commentary is
+        # trace activity, not final assistant body text. Normalize legacy rows
+        # at egress so live, catch-up, and reload paths all agree without
+        # rewriting durable history.
         safe = dict(event)
-        safe["type"] = "assistant_text"
+        safe["type"] = "reasoning_summary"
     if (
         "provider_cross_chat_route_snapshot" in event
         or "secure_peer_route_snapshots" in event

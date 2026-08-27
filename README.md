@@ -622,6 +622,7 @@ without losing chat state:
 | `AGENTSDOCK_CLAUDE_SDK_IDLE_TTL_SECONDS` | Idle per-chat SDK client retention | `300` |
 | `AGENTSDOCK_CLAUDE_SDK_MAX_LOADED_CHATS` | Maximum retained per-chat SDK clients | `4` |
 | `CODEX_BIN` | Codex executable name/path | `codex` |
+| `AGENTSDOCK_CODEX_APP_SERVER_MAX_LOADED_THREADS` | Maximum retained idle Codex app-server threads | `20` |
 | `AGENTSDOCK_RUNTIME_DIAGNOSTIC_TTL_SECONDS` | Cache lifetime for safe CLI version/auth probes | `60` |
 | `CLAUDE_PROJECTS_ROOT` | Claude history search root | `~/.claude/projects` |
 | `CODEX_SESSIONS_ROOT` | Codex history search root | `~/.codex/sessions` |

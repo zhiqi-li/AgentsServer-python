@@ -1444,6 +1444,41 @@ class CodexAppServerClient:
         self._loaded_threads.discard(thread_id)
         self._known_thread_ids.discard(thread_id)
 
+    async def list_models(self) -> list[dict[str, Any]]:
+        """Read the authenticated picker catalog, including every page."""
+        models: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {"includeHidden": False, "limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            method = "model/list"
+            result = _protocol_object(method, await self.request(method, params))
+            data = result.get("data")
+            if not isinstance(data, list) or any(
+                not isinstance(model, dict)
+                or not isinstance(model.get("model"), str)
+                or not model["model"].strip()
+                for model in data
+            ):
+                raise CodexAppServerProtocolError(
+                    "model/list returned an invalid model list",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            models.extend(dict(model) for model in data)
+            cursor = _protocol_cursor(method, result)
+            if cursor is None:
+                return models
+            if cursor in seen_cursors:
+                raise CodexAppServerProtocolError(
+                    "model/list repeated a pagination cursor",
+                    request_sent=True,
+                    safe_to_retry=False,
+                )
+            seen_cursors.add(cursor)
+
     async def list_turns(
         self,
         thread_id: str,

@@ -137,6 +137,39 @@ class CodexAppServerClientTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_model_catalog_reads_all_pages(self) -> None:
+        factory = FakeProcessFactory()
+        factory.process.responders["model/list"] = lambda message: (
+            {"data": [{"model": "gpt-5.3-codex-spark"}], "nextCursor": None}
+            if message["params"].get("cursor") == "next"
+            else {"data": [{"model": "gpt-6-astra"}], "nextCursor": "next"}
+        )
+        client = self.make_client(factory)
+        self.addAsyncCleanup(client.close)
+        models = await client.list_models()
+        self.assertEqual([m["model"] for m in models], ["gpt-6-astra", "gpt-5.3-codex-spark"])
+        requests = [m["params"] for m in factory.process.messages if m.get("method") == "model/list"]
+        self.assertEqual(requests, [
+            {"includeHidden": False, "limit": 100},
+            {"includeHidden": False, "limit": 100, "cursor": "next"},
+        ])
+
+    async def test_model_catalog_rejects_bad_pages_and_cursor_loops(self) -> None:
+        for response in (
+            {"data": [{"model": "gpt-6-astra"}], "nextCursor": "loop"},
+            {"data": [None], "nextCursor": None},
+            {"data": [{"model": ""}], "nextCursor": None},
+        ):
+            with self.subTest(response=response):
+                factory = FakeProcessFactory()
+                factory.process.responders["model/list"] = lambda _, r=response: r
+                client = self.make_client(factory)
+                try:
+                    with self.assertRaises(CodexAppServerProtocolError):
+                        await client.list_models()
+                finally:
+                    await client.close()
+
     async def test_async_notification_handler_preserves_wire_order(self) -> None:
         factory = FakeProcessFactory()
         client = self.make_client(factory)

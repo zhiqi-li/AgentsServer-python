@@ -143,7 +143,8 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             "ultra",
         )
 
-    def test_codex_catalog_preserves_model_scoped_efforts(self) -> None:
+    @patch.object(agent_server, "discover_codex_app_server_models", side_effect=RuntimeError("old CLI"))
+    def test_codex_catalog_preserves_model_scoped_efforts(self, _probe) -> None:
         payload = {
             "models": [
                 {
@@ -190,7 +191,8 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             ["medium", "max"],
         )
 
-    def test_codex_catalog_default_matches_runtime_fallback(self) -> None:
+    @patch.object(agent_server, "discover_codex_app_server_models", side_effect=RuntimeError("old CLI"))
+    def test_codex_catalog_default_matches_runtime_fallback(self, _probe) -> None:
         payload = {
             "models": [
                 {
@@ -223,6 +225,45 @@ class RuntimeDiagnosticTests(unittest.TestCase):
             catalog = agent_server.discover_codex_catalog()
 
         self.assertEqual(catalog["default_model"], agent_server.CODEX_DEFAULT_MODEL)
+
+    def test_codex_native_catalog_preserves_spark_and_astra_efforts(self) -> None:
+        native = [
+            {"model": "gpt-6-astra", "displayName": "GPT-6-Astra", "hidden": False,
+             "defaultReasoningEffort": "low", "defaultServiceTier": "priority",
+             "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "ultra"}]},
+            {"model": "gpt-5.3-codex-spark", "displayName": "GPT-5.3-Codex-Spark",
+             "hidden": False, "defaultReasoningEffort": "high",
+             "supportedReasoningEfforts": [{"reasoningEffort": "high"}]},
+        ]
+        with (
+            patch.object(agent_server.CodexAppServerClient, "list_models", AsyncMock(return_value=native)),
+            patch.object(agent_server.CodexAppServerClient, "close", AsyncMock()) as close,
+            patch.object(agent_server, "run_catalog_command") as legacy,
+            patch.object(agent_server, "codex_user_config_defaults", return_value=("gpt-6-astra", "low", "priority")),
+        ):
+            catalog = agent_server.discover_codex_catalog()
+        legacy.assert_not_called()
+        close.assert_awaited_once()
+        self.assertEqual(catalog["model_source"], "codex app-server model/list")
+        self.assertEqual(catalog["default_model"], "gpt-6-astra")
+        self.assertEqual(catalog["default_effort"], "low")
+        self.assertEqual(catalog["default_service_tier"], "priority")
+        self.assertEqual([m["value"] for m in catalog["models"]], ["", "gpt-6-astra", "gpt-5.3-codex-spark"])
+        self.assertEqual([e["value"] for e in catalog["model_efforts"]["gpt-6-astra"]], ["low", "ultra"])
+
+    def test_codex_legacy_fallback_keeps_chatgpt_only_models(self) -> None:
+        payload = {"models": [
+            {"slug": "gpt-5.3-codex-spark", "visibility": "list", "supported_in_api": False},
+            {"slug": "hidden-model", "visibility": "hide"},
+        ]}
+        with (
+            patch.object(agent_server, "discover_codex_app_server_models", side_effect=TimeoutError()),
+            patch.object(agent_server, "run_catalog_command", return_value=json.dumps(payload)),
+            patch.object(agent_server, "codex_user_config_defaults", return_value=("", "", "")),
+        ):
+            catalog = agent_server.discover_codex_catalog()
+        self.assertEqual(catalog["model_source"], "codex debug models")
+        self.assertEqual([m["value"] for m in catalog["models"]], ["", "gpt-5.3-codex-spark"])
 
     def test_transient_provider_failure_keeps_cli_ready(self) -> None:
         agent_server.store_runtime_diagnostic(agent_server.runtime_diagnostic_payload(

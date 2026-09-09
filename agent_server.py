@@ -64,6 +64,7 @@ import uvicorn
 import websockets
 
 from codex_app_server import (
+    CodexAppServerClient,
     CodexAppServerDisconnected,
     CodexAppServerError,
     CodexAppServerManager,
@@ -32351,6 +32352,44 @@ def discovered_codex_default_model(models: list[dict[str, Any]], preferred_slug:
     return None
 
 
+def discover_codex_app_server_models() -> list[dict[str, Any]]:
+    """Probe without loading user threads or invoking inference.
+
+    Catalog discovery runs in an HTTP worker thread. Use a short-lived client
+    so this synchronous probe never touches the live manager's event loop.
+    """
+    async def probe() -> list[dict[str, Any]]:
+        client = CodexAppServerClient(
+            CODEX_BIN,
+            cwd=existing_cwd(DEFAULT_CWD),
+            env_factory=runner_env,
+            request_timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
+        )
+        try:
+            return await asyncio.wait_for(
+                client.list_models(), timeout=RUNTIME_CATALOG_TIMEOUT_SECONDS,
+            )
+        finally:
+            await client.close()
+
+    return [
+        {
+            "slug": model["model"],
+            "display_name": model.get("displayName"),
+            "visibility": "hide" if model.get("hidden") else "list",
+            "default_reasoning_level": model.get("defaultReasoningEffort"),
+            "supported_reasoning_levels": [
+                {"effort": level.get("reasoningEffort")}
+                for level in model.get("supportedReasoningEfforts") or []
+                if isinstance(level, dict)
+            ],
+            "default_service_tier": model.get("defaultServiceTier"),
+            "priority": index,
+        }
+        for index, model in enumerate(asyncio.run(probe()))
+    ]
+
+
 def discover_codex_catalog() -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     model_options: list[dict[str, Any]] = []
@@ -32361,22 +32400,32 @@ def discover_codex_catalog() -> dict[str, Any]:
     default_effort = ""
     default_effort_label = ""
     default_service_tier = ""
-    model_source = "codex debug models"
-    effort_source = "codex debug models"
+    model_source = "codex app-server model/list"
+    effort_source = model_source
     configured_model, configured_effort, configured_service_tier = codex_user_config_defaults()
     try:
-        payload = json.loads(run_catalog_command([CODEX_BIN, "debug", "models"]))
-        raw_models = payload.get("models") if isinstance(payload, dict) else None
-        if isinstance(raw_models, list):
-            models = [model for model in raw_models if isinstance(model, dict)]
+        models = discover_codex_app_server_models()
+        if not models:
+            raise ValueError("model/list returned an empty catalog")
     except Exception as exc:
-        logger.warning("codex model discovery failed: %s", exc)
-        model_source = f"{model_source} failed"
-        effort_source = f"{effort_source} failed"
+        logger.debug("codex app-server model discovery failed: %s", exc)
+        model_source = "codex debug models"
+        effort_source = model_source
+        try:
+            payload = json.loads(run_catalog_command([CODEX_BIN, "debug", "models"]))
+            raw_models = payload.get("models") if isinstance(payload, dict) else None
+            if isinstance(raw_models, list):
+                models = [model for model in raw_models if isinstance(model, dict)]
+        except Exception as fallback_exc:
+            logger.warning("codex model discovery failed: %s", fallback_exc)
+            model_source = f"{model_source} failed"
+            effort_source = model_source
 
     visible_models = [
         model for model in models
-        if str(model.get("visibility") or "list") == "list" and model.get("supported_in_api", True) is not False
+        # supported_in_api describes the public API, not ChatGPT-auth Codex.
+        # In particular Spark is selectable in Codex despite that flag.
+        if str(model.get("visibility") or "list") == "list"
     ]
     visible_models.sort(key=runtime_priority)
     # The selectable "Server default" must describe the model that

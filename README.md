@@ -67,6 +67,26 @@ machine paths.
   rejected with an actionable error before timeline activity when their
   selected runtime is unavailable.
 
+## AgentsFleet Codex compatibility
+
+The `integration/agentsfleet-main` branch supports the Codex CLI 0.153.4
+app-server contract. Model discovery prefers the authenticated, paginated
+`model/list` catalog and preserves model-specific reasoning efforts and default
+service tiers, including GPT-6-Astra and ChatGPT-only models such as Spark.
+Older CLIs fall back to `codex debug models`, then the existing static defaults.
+Catalog discovery never creates a thread or requests inference.
+
+Manual compaction uses `thread/compact/start`; automatic compaction is projected
+from `contextCompaction` items. Token usage and compaction lifecycle regression
+tests cover before/after snapshots, replay deduplication, cancellation, and
+timeline ownership. These checks do not claim an end-to-end inference test.
+
+Run `python scripts/check_codex_compatibility.py` in the server environment to
+check the installed CLI's generated schema and live model catalog. Run
+`python -m unittest -q test_runtime_diagnostics test_codex_runtime_settings
+test_codex_app_server test_codex_controls test_compact_timeline_paging` for the
+associated regressions.
+
 ## Requirements
 
 - Linux or macOS host with Python 3.10+.
